@@ -148,8 +148,6 @@ class _TimesFMDetectorConfig:
     zscore_threshold: float = 5.0
     min_refresh: int = 5   # min steps between forecast refreshes per key
     max_refresh: int = 10  # max steps between forecast refreshes per key
-    model_gcs_path: Optional[str] = None  # GCS path for pre-staged model
-
     def __post_init__(self):
         if self.min_refresh < 1:
             raise ValueError(
@@ -183,32 +181,13 @@ class TimesFMModelHandler(ModelHandler[dict, PredictionResult, Any]):
     def load_model(self):
         import torch
         from transformers import TimesFm2_5ModelForPrediction
-        model_path = self._model_name
-        if model_path.startswith('gs://'):
-            model_path = self._download_from_gcs(model_path)
-        _LOGGER.warning('[TimesFM] Loading model from %s', model_path)
+        _LOGGER.warning('[TimesFM] Loading model from %s', self._model_name)
         t0 = time.time()
-        model = TimesFm2_5ModelForPrediction.from_pretrained(model_path)
+        model = TimesFm2_5ModelForPrediction.from_pretrained(self._model_name)
         model.eval()
         model.requires_grad_(False)
         _LOGGER.warning('[TimesFM] Model loaded in %.1fs', time.time() - t0)
         return model
-
-    @staticmethod
-    def _download_from_gcs(gcs_path):
-        """Download model files from GCS to a local temp directory."""
-        import subprocess
-        import tempfile
-        local_dir = tempfile.mkdtemp(prefix='timesfm_model_')
-        _LOGGER.warning('[TimesFM] Downloading model from %s to %s',
-                        gcs_path, local_dir)
-        t0 = time.time()
-        subprocess.run(
-            ['gsutil', '-m', 'cp', '-r', f'{gcs_path}/*', f'{local_dir}/'],
-            capture_output=True, check=True)
-        _LOGGER.warning('[TimesFM] Downloaded from GCS in %.1fs',
-                        time.time() - t0)
-        return local_dir
 
     def _prepare_context(self, context):
         """Prepare a context array for TimesFM inference.
