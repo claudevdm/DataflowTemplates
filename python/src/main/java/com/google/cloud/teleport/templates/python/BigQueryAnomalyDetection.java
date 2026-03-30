@@ -30,7 +30,9 @@ import com.google.cloud.teleport.metadata.TemplateParameter;
         "[Experimental] Real-time anomaly detection on BigQuery change data (CDC). "
             + "Reads streaming APPENDS/CHANGES data from a BigQuery table, "
             + "computes a configurable windowed metric, runs anomaly detection "
-            + "(ZScore, IQR, or RobustZScore), and publishes anomalies to Pub/Sub.",
+            + "(ZScore, IQR, RobustZScore, or TimesFM), and publishes anomalies to Pub/Sub. "
+            + "TimesFM uses Google's foundation model for zero-shot time-series forecasting "
+            + "with quantile-based anomaly scoring.",
     preview = true,
     flexContainerName = "bigquery-anomaly-detection",
     filesToCopy = {"main.py", "setup.py", "pyproject.toml", "requirements_all.txt", "src"},
@@ -63,9 +65,10 @@ public interface BigQueryAnomalyDetection {
       description = "Detector Specification (JSON)",
       helpText =
           "JSON string defining the anomaly detector. "
-              + "Example: {\"type\":\"ZScore\"} or "
-              + "{\"type\":\"ZScore\",\"config\":{\"threshold_criterion\":{\"type\":\"FixedThreshold\","
-              + "\"config\":{\"cutoff\":10}}}}")
+              + "Statistical: {\"type\":\"ZScore\"}, {\"type\":\"IQR\"}, {\"type\":\"RobustZScore\"}. "
+              + "Threshold: {\"type\":\"Threshold\",\"expression\":\"value >= 100\"}. "
+              + "TimesFM (foundation model): {\"type\":\"TimesFM\"} or "
+              + "{\"type\":\"TimesFM\",\"config\":{\"max_context\":1024,\"confidence\":90}}.")
   String getDetectorSpec();
 
   @TemplateParameter.Text(

@@ -32,6 +32,7 @@ from bqmonitor.pipeline import _parse_detector_spec
 from bqmonitor.pipeline import _parse_table_ref
 from bqmonitor.pipeline import _ThresholdAlert
 from bqmonitor.pipeline import _unpack_result
+from apache_beam.utils.timestamp import Timestamp
 
 
 class ParseTableRefTest(unittest.TestCase):
@@ -134,7 +135,7 @@ class ThresholdAlertTest(unittest.TestCase):
   """Tests for _ThresholdAlert DoFn."""
 
   def _make_row(self, value):
-    return beam.Row(value=value, window_start=0.0, window_end=1.0)
+    return beam.Row(value=value, window_start=Timestamp(0), window_end=Timestamp(1))
 
   def _run_dofn(self, expression, element):
     dofn = _ThresholdAlert(expression)
@@ -192,7 +193,7 @@ class FormatAnomalyAsJsonTest(unittest.TestCase):
   """Tests for _FormatAnomalyAsJson DoFn."""
 
   def _make_result(self, label, value=42.0, score=5.0, model_id='TestModel'):
-    row = beam.Row(value=value, window_start=1000.0, window_end=1001.0)
+    row = beam.Row(value=value, window_start=Timestamp(1000), window_end=Timestamp(1001))
     prediction = AnomalyPrediction(
         model_id=model_id, score=score, label=label)
     return AnomalyResult(example=row, predictions=[prediction])
@@ -236,7 +237,7 @@ class FormatResultForBQTest(unittest.TestCase):
   """Tests for _FormatResultForBQ DoFn."""
 
   def _make_result(self, label, value=42.0, score=5.0):
-    row = beam.Row(value=value, window_start=1000.0, window_end=1001.0)
+    row = beam.Row(value=value, window_start=Timestamp(1000), window_end=Timestamp(1001))
     prediction = AnomalyPrediction(
         model_id='TestModel', score=score, label=label)
     return AnomalyResult(example=row, predictions=[prediction])
@@ -274,7 +275,7 @@ class FormatResultForBQTest(unittest.TestCase):
     self.assertEqual(outputs[0]['key'], 'campaign_search')
 
   def test_none_score(self):
-    row = beam.Row(value=10.0, window_start=0.0, window_end=1.0)
+    row = beam.Row(value=10.0, window_start=Timestamp(0), window_end=Timestamp(1))
     prediction = AnomalyPrediction(
         model_id='Test', score=None, label=0)
     result = AnomalyResult(example=row, predictions=[prediction])

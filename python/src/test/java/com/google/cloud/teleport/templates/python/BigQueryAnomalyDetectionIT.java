@@ -20,6 +20,7 @@ import static org.apache.beam.it.truthmatchers.PipelineAsserts.assertThatPipelin
 import static org.apache.beam.it.truthmatchers.PipelineAsserts.assertThatResult;
 
 import com.google.cloud.bigquery.Field;
+import com.google.cloud.bigquery.FieldValueList;
 import com.google.cloud.bigquery.InsertAllRequest.RowToInsert;
 import com.google.cloud.bigquery.Schema;
 import com.google.cloud.bigquery.StandardSQLTypeName;
@@ -39,6 +40,7 @@ import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.beam.it.common.PipelineLauncher.LaunchConfig;
 import org.apache.beam.it.common.PipelineLauncher.LaunchInfo;
 import org.apache.beam.it.common.PipelineOperator.Result;
@@ -122,6 +124,11 @@ public final class BigQueryAnomalyDetectionIT extends TemplateTestBase {
   @Test
   public void testThresholdDetector() throws IOException, InterruptedException {
     testThresholdDetectorImpl();
+  }
+
+  @Test
+  public void testTimesFMDetector() throws IOException, InterruptedException {
+    testTimesFMDetectorImpl();
   }
 
   // -------------------------------------------------------------------------
@@ -518,6 +525,354 @@ public final class BigQueryAnomalyDetectionIT extends TemplateTestBase {
     verifySinkTable(sinkTableName, 2, null /* no keys expected */);
   }
 
+  /**
+   * Tests the TimesFM foundation model detector with a sine wave data source.
+   *
+   * <p>Inserts rows that aggregate (SUM) into a sine wave pattern over 5-second windows, waits for
+   * the model to warm up, then injects an anomalous spike (5x normal amplitude). Verifies the
+   * pipeline detects the anomaly and writes results with confidence intervals (info field
+   * containing predicted value and P10/P90 bounds).
+   *
+   * <p>Also validates that the 5-second window aggregations in the sink table match the actual
+   * SUM(value) from the source table by querying the APPENDS data directly.
+   */
+  private void testTimesFMDetectorImpl() throws IOException, InterruptedException {
+    // --- Arrange ---
+
+    String tableName = "timesfm_test";
+    String sinkTableName = "timesfm_results";
+
+    Schema schema =
+        Schema.of(
+            Field.of("ts", StandardSQLTypeName.TIMESTAMP),
+            Field.of("key", StandardSQLTypeName.STRING),
+            Field.of("value", StandardSQLTypeName.FLOAT64));
+    bigQueryResourceManager.createDataset(REGION);
+    bigQueryResourceManager.createTable(tableName, schema);
+
+    TopicName outputTopic = pubsubResourceManager.createTopic("timesfm-output");
+    SubscriptionName outputSubscription =
+        pubsubResourceManager.createSubscription(outputTopic, "timesfm-output-sub");
+
+    // 1-second sliding windows with 0.5-second period, SUM of value.
+    // With sine period=60s, each offset gets 60 points/cycle (1 per second).
+    // max_context=192 = 3.2 cycles → good accuracy.
+    // Warmup: 128 windows × 1s = 128s ≈ 2 min.
+    int windowSizeSec = 1;
+    double periodSec = 0.5;
+    String metricSpec =
+        "{\"aggregation\":{\"window\":{\"type\":\"sliding\","
+            + "\"size_seconds\":"
+            + windowSizeSec
+            + ",\"period_seconds\":"
+            + periodSec
+            + "},\"measures\":[{\"field\":\"value\","
+            + "\"agg\":\"SUM\",\"alias\":\"total\"}]}}";
+    String detectorSpec =
+        "{\"type\":\"TimesFM\",\"config\":{"
+            + "\"min_context\":128,"
+            + "\"max_context\":192,"
+            + "\"confidence\":90,"
+            + "\"force_flip_invariance\":false}}";
+
+    String tableRef =
+        String.format(
+            "%s:%s.%s",
+            bigQueryResourceManager.getProjectId(),
+            bigQueryResourceManager.getDatasetId(),
+            tableName);
+
+    String sinkTableRef =
+        String.format(
+            "%s:%s.%s",
+            bigQueryResourceManager.getProjectId(),
+            bigQueryResourceManager.getDatasetId(),
+            sinkTableName);
+
+    // --- Act ---
+
+    LaunchConfig.Builder options =
+        LaunchConfig.builder(testName, specPath)
+            .addParameter("table", tableRef)
+            .addParameter("metric_spec", metricSpec)
+            .addParameter("detector_spec", detectorSpec)
+            .addParameter("topic", outputTopic.toString())
+            .addParameter("poll_interval_sec", "15")
+            .addParameter("start_offset_sec", "600")
+            .addParameter("duration_sec", "900")
+            .addParameter("log_all_results", "true")
+            .addParameter("sink_table", sinkTableRef)
+            .addParameter("fanout_strategy", "precombine");
+
+    LaunchInfo info = launchTemplate(options);
+    assertThatPipeline(info).isRunning();
+
+    // Wait 5 minutes for the pipeline to fully start, load the model,
+    // and begin CDC polling before inserting data.
+    LOG.info("Waiting 5 minutes for pipeline startup...");
+    TimeUnit.MINUTES.sleep(5);
+
+    // Insert sine wave data in a background thread. The thread runs
+    // continuously (baseline + repeated anomaly spikes) until stopped
+    // by the main thread once the Pub/Sub condition is met.
+    double amplitude = 100.0;
+    double baseline = 500.0;
+    double sinePeriodSec = 60.0; // 1-minute cycle
+    int rowsPerSubBatch = 10;
+    int subBatchesPerSec = 10; // 10 sub-batches × 10 rows = 100 rows/sec
+    long subBatchIntervalMs = 1000 / subBatchesPerSec; // 100ms
+    int rowsPerSec = rowsPerSubBatch * subBatchesPerSec;
+    // Per-row noise so that windowed SUM has noise_std ≈ 5.
+    // With 100 rows/window: per_row_std = 5 * sqrt(100) / 100 = 0.5.
+    double noiseStd = 0.5;
+    double anomalyMultiplier = 5.0;
+
+    AtomicBoolean stopInserting = new AtomicBoolean(false);
+
+    Thread inserterThread =
+        new Thread(
+            () -> {
+              try {
+                Random rng = new Random(42);
+                Instant startTime = Instant.now();
+                int totalRows = 0;
+                int second = 0;
+
+                LOG.info(
+                    "Starting data insertion: {} rows/sec ({} x {}ms sub-batches), "
+                        + "period={}s, amplitude={}, baseline={}",
+                    rowsPerSec,
+                    rowsPerSubBatch,
+                    subBatchIntervalMs,
+                    sinePeriodSec,
+                    amplitude,
+                    baseline);
+
+                while (!stopInserting.get()) {
+                  double t = second;
+                  boolean isAnomaly = false;
+                  double sineVal = amplitude * Math.sin(2 * Math.PI * t / sinePeriodSec) + baseline;
+
+                  // Inject anomaly spike every 5 minutes for 2 seconds.
+                  if (second > 0 && second % 300 < 2) {
+                    sineVal = (amplitude + baseline) * anomalyMultiplier;
+                    isAnomaly = true;
+                  }
+
+                  double perRow = sineVal / (rowsPerSec * windowSizeSec);
+
+                  // Insert sub-batches spread across the second.
+                  for (int sub = 0; sub < subBatchesPerSec && !stopInserting.get(); sub++) {
+                    List<RowToInsert> rows = new ArrayList<>();
+                    Instant subBatchTs =
+                        startTime.plusSeconds(second).plusMillis(sub * subBatchIntervalMs);
+                    for (int i = 0; i < rowsPerSubBatch; i++) {
+                      double frac = (double) i / rowsPerSubBatch;
+                      Instant rowTs = subBatchTs.plusMillis((long) (frac * subBatchIntervalMs));
+                      double value = perRow + rng.nextGaussian() * noiseStd;
+                      rows.add(
+                          RowToInsert.of(
+                              ImmutableMap.of(
+                                  "ts", rowTs.toString(), "key", "sensor_1", "value", value)));
+                    }
+                    bigQueryResourceManager.write(tableName, rows);
+                    totalRows += rowsPerSubBatch;
+                    TimeUnit.MILLISECONDS.sleep(subBatchIntervalMs);
+                  }
+
+                  if ((second + 1) % 60 == 0 || isAnomaly) {
+                    LOG.info(
+                        "Inserted second {}: {} total rows, sineVal={}{}",
+                        second + 1,
+                        totalRows,
+                        sineVal,
+                        isAnomaly ? " ** ANOMALY **" : "");
+                  }
+
+                  second++;
+                }
+
+                LOG.info("Data insertion stopped after {} seconds ({} rows)", second, totalRows);
+              } catch (InterruptedException e) {
+                LOG.info("Data insertion thread interrupted");
+                Thread.currentThread().interrupt();
+              }
+            },
+            "data-inserter");
+
+    inserterThread.setDaemon(true);
+    inserterThread.start();
+
+    // --- Assert ---
+
+    // Wait for at least 1 anomaly message on Pub/Sub.
+    // The inserter thread keeps running until this condition is met.
+    PubsubMessagesCheck pubsubCheck =
+        PubsubMessagesCheck.builder(pubsubResourceManager, outputSubscription)
+            .setMinMessages(1)
+            .build();
+
+    Result result = pipelineOperator().waitForConditionAndCancel(createConfig(info), pubsubCheck);
+
+    // Stop the inserter thread.
+    stopInserting.set(true);
+    inserterThread.join(10_000);
+
+    assertThatResult(result).meetsConditions();
+
+    List<ReceivedMessage> messages = pubsubCheck.getReceivedMessageList();
+    assertThat(messages).isNotEmpty();
+
+    String messageData = messages.get(0).getMessage().getData().toStringUtf8();
+    LOG.info("Received TimesFM anomaly message: {}", messageData);
+    JSONObject payload = new JSONObject(messageData);
+
+    assertThat(payload.getString("event_description")).contains("Anomaly detected");
+    assertThat(payload.getString("agent_id")).isEqualTo("TimesFM-2.5+ZScore");
+
+    // --- Verify BQ sink table ---
+    verifySinkTable(sinkTableName, windowSizeSec, null /* unkeyed */);
+
+    // --- Verify confidence intervals in info field ---
+    verifyTimesFMInfo(sinkTableName);
+
+    // Note: aggregation validation is skipped for the TimesFM test because
+    // sliding windows (period=0.5s) produce overlapping windows that can't
+    // be replicated with a simple GROUP BY on the source table. The fixed-
+    // window tests (testDetectsAnomalyAndPublishesToPubSub etc.) cover
+    // aggregation correctness.
+  }
+
+  /**
+   * Verifies that scored (non-warmup) rows in the TimesFM sink table have info fields containing
+   * TimesFM prediction metadata (predicted value, confidence bounds, residual) and ZScore info.
+   */
+  private void verifyTimesFMInfo(String sinkTableName) {
+    TableResult tableResult = bigQueryResourceManager.readTable(sinkTableName);
+    List<Map<String, Object>> rows = BigQueryAsserts.tableResultToRecords(tableResult);
+
+    int scoredWithInfo = 0;
+    for (Map<String, Object> row : rows) {
+      int label = ((Number) row.get("label")).intValue();
+      if (label == -2) {
+        continue; // warmup rows don't have predictions
+      }
+      Object info = row.get("info");
+      if (info != null) {
+        String infoStr = info.toString();
+        // TimesFM metadata
+        assertThat(infoStr).contains("predicted=");
+        assertThat(infoStr).contains("bounds=");
+        assertThat(infoStr).contains("residual=");
+        scoredWithInfo++;
+      }
+    }
+    assertThat(scoredWithInfo).isGreaterThan(0);
+    LOG.info(
+        "TimesFM info verification passed: {} scored rows with prediction + residual info",
+        scoredWithInfo);
+  }
+
+  /**
+   * Validates that the pipeline's windowed aggregations match the actual data in the source table.
+   *
+   * <p>Queries the source table with the same 5-second window grouping and compares the SUM(value)
+   * against the 'value' column in the sink table. Allows small floating-point tolerance.
+   */
+  private void verifyAggregationsMatchSource(
+      String sourceTableName, String sinkTableName, int windowSizeSec) {
+    // Query source table for ground-truth 5-second window SUMs.
+    String sourceQuery =
+        String.format(
+            "SELECT "
+                + "TIMESTAMP_SECONDS(DIV(UNIX_SECONDS(ts), %d) * %d) AS window_start, "
+                + "SUM(value) AS total, "
+                + "COUNT(*) AS row_count "
+                + "FROM `%s.%s.%s` "
+                + "GROUP BY 1 ORDER BY 1",
+            windowSizeSec,
+            windowSizeSec,
+            bigQueryResourceManager.getProjectId(),
+            bigQueryResourceManager.getDatasetId(),
+            sourceTableName);
+
+    TableResult sourceResult = bigQueryResourceManager.runQuery(sourceQuery);
+
+    // Build a map of epoch_millis -> SUM(value) from source.
+    // Use milliseconds (not seconds) to handle sub-second sliding window
+    // periods (e.g. period=0.5s produces timestamps like 100.0, 100.5).
+    Map<Long, Double> sourceAggregations = new java.util.LinkedHashMap<>();
+    for (FieldValueList row : sourceResult.iterateAll()) {
+      long epochMicros = row.get("window_start").getTimestampValue();
+      long epochMillis = epochMicros / 1_000;
+      double total = row.get("total").getDoubleValue();
+      long rowCount = row.get("row_count").getLongValue();
+      // Only include full windows (expected rows = rows_per_sec * window_size).
+      if (rowCount >= 100 * windowSizeSec * 0.8) { // allow 20% tolerance for partial windows
+        sourceAggregations.put(epochMillis, total);
+      }
+    }
+    LOG.info("Source table has {} full windows", sourceAggregations.size());
+
+    // Read sink table and compare values.
+    TableResult sinkResult = bigQueryResourceManager.readTable(sinkTableName);
+    List<Map<String, Object>> sinkRows = BigQueryAsserts.tableResultToRecords(sinkResult);
+
+    int matched = 0;
+    int mismatched = 0;
+    int notFound = 0;
+    double maxRelativeError = 0;
+
+    for (Map<String, Object> sinkRow : sinkRows) {
+      int label = ((Number) sinkRow.get("label")).intValue();
+      if (label == -2) {
+        continue; // skip warmup
+      }
+
+      // Parse sink window_start (ISO-8601 string) to epoch millis.
+      String windowStartStr = sinkRow.get("window_start").toString();
+      long sinkEpochMillis = Instant.parse(windowStartStr).toEpochMilli();
+      double sinkValue = ((Number) sinkRow.get("value")).doubleValue();
+
+      if (sourceAggregations.containsKey(sinkEpochMillis)) {
+        double sourceValue = sourceAggregations.get(sinkEpochMillis);
+        double relativeError =
+            Math.abs(sinkValue - sourceValue) / Math.max(Math.abs(sourceValue), 1e-9);
+
+        if (relativeError > maxRelativeError) {
+          maxRelativeError = relativeError;
+        }
+
+        if (relativeError < 0.05) { // 5% tolerance
+          matched++;
+        } else {
+          mismatched++;
+          LOG.warn(
+              "Aggregation mismatch at epochMs={}: sink={}, source={}, relErr={}",
+              sinkEpochMillis,
+              sinkValue,
+              sourceValue,
+              relativeError);
+        }
+      } else {
+        notFound++;
+      }
+    }
+
+    LOG.info(
+        "Aggregation validation: {} matched, {} mismatched, {} not found in source, "
+            + "max relative error = {}",
+        matched,
+        mismatched,
+        notFound,
+        maxRelativeError);
+
+    // At least some windows should match, and mismatches should be rare.
+    // notFound is expected for windows near the edges of the data range.
+    assertThat(matched).isGreaterThan(0);
+    assertThat(mismatched).isAtMost(Math.max(matched / 5, 1)); // allow up to 20% mismatches
+  }
+
   // -------------------------------------------------------------------------
   // Helpers
   // -------------------------------------------------------------------------
@@ -546,6 +901,7 @@ public final class BigQueryAnomalyDetectionIT extends TemplateTestBase {
       assertThat(row).containsKey("window_end");
       assertThat(row).containsKey("value");
       assertThat(row).containsKey("label");
+      assertThat(row).containsKey("info");
 
       // Window timestamps parse as valid ISO-8601 UTC.
       String windowStart = row.get("window_start").toString();

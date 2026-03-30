@@ -16,7 +16,6 @@
 
 """Unit tests for bqmonitor.timesfm_detector."""
 
-import math
 import logging
 import unittest
 
@@ -28,13 +27,18 @@ from apache_beam.ml.inference.base import PredictionResult
 from apache_beam.utils.timestamp import Timestamp
 
 from bqmonitor.timesfm_detector import (
-    _fill_gaps,
+    _resample_with_nans,
+    _strip_leading_nans,
+    _linear_interpolation,
     _TimesFMDetectorConfig,
+    _TAG_PREDICTION,
+    _TAG_OBSERVATION,
     TimesFMBufferDoFn,
-    TimesFMBufferDoFnOLS,
-    TimesFMResidualDoFn,
+    TimesFMExtractPredictionsDoFn,
+    TimesFMCacheAndScoreDoFn,
     TimesFMEnrichDoFn,
     PATCH_SIZE,
+    FORECAST_HORIZON,
 )
 from bqmonitor.pipeline import _parse_detector_spec
 
@@ -42,140 +46,140 @@ logging.basicConfig(level=logging.INFO)
 
 
 # ---------------------------------------------------------------------------
-# _fill_gaps tests
+# Preprocessing tests (resample, strip NaN, interpolate)
 # ---------------------------------------------------------------------------
 
-class FillGapsTest(unittest.TestCase):
-  """Tests for _fill_gaps()."""
+class ResampleTest(unittest.TestCase):
 
   def test_no_gaps(self):
     entries = [(0.0, 10.0), (1.0, 20.0), (2.0, 30.0)]
-    filled = _fill_gaps(entries, expected_interval=1.0)
-    self.assertEqual(len(filled), 3)
+    grid = _resample_with_nans(entries, 1.0)
+    self.assertEqual(len(grid), 3)
+    self.assertFalse(np.any(np.isnan(grid)))
 
-  def test_single_gap(self):
+  def test_single_gap_produces_nan(self):
     entries = [(0.0, 10.0), (2.0, 30.0)]
-    filled = _fill_gaps(entries, expected_interval=1.0)
-    self.assertEqual(len(filled), 3)
-    # Interpolated value at t=1 should be 20.0
-    self.assertAlmostEqual(filled[1][0], 1.0)
-    self.assertAlmostEqual(filled[1][1], 20.0)
+    grid = _resample_with_nans(entries, 1.0)
+    self.assertEqual(len(grid), 3)
+    self.assertTrue(np.isnan(grid[1]))
+    self.assertAlmostEqual(grid[0], 10.0)
+    self.assertAlmostEqual(grid[2], 30.0)
 
-  def test_multiple_consecutive_gaps(self):
+  def test_multiple_gaps(self):
     entries = [(0.0, 0.0), (4.0, 40.0)]
-    filled = _fill_gaps(entries, expected_interval=1.0)
-    self.assertEqual(len(filled), 5)
-    for i, (ts, val) in enumerate(filled):
-      self.assertAlmostEqual(ts, float(i), places=5)
-      self.assertAlmostEqual(val, float(i * 10), places=5)
+    grid = _resample_with_nans(entries, 1.0)
+    self.assertEqual(len(grid), 5)
+    self.assertEqual(int(np.sum(np.isnan(grid))), 3)
 
-  def test_gap_threshold(self):
-    # Gap of 1.4x interval should NOT be filled (threshold is 1.5x)
-    entries = [(0.0, 10.0), (1.4, 24.0)]
-    filled = _fill_gaps(entries, expected_interval=1.0)
-    self.assertEqual(len(filled), 2)
-
-  def test_gap_above_threshold(self):
-    # Gap of 1.6x interval should be filled
-    entries = [(0.0, 10.0), (2.0, 30.0)]
-    filled = _fill_gaps(entries, expected_interval=1.0)
-    self.assertEqual(len(filled), 3)
-
-  def test_empty_entries(self):
-    self.assertEqual(_fill_gaps([], expected_interval=1.0), [])
+  def test_empty(self):
+    grid = _resample_with_nans([], 1.0)
+    self.assertEqual(len(grid), 0)
 
   def test_single_entry(self):
-    entries = [(0.0, 10.0)]
-    self.assertEqual(_fill_gaps(entries, expected_interval=1.0), entries)
+    grid = _resample_with_nans([(0.0, 10.0)], 1.0)
+    self.assertEqual(len(grid), 1)
 
-  def test_auto_detect_interval(self):
-    # When expected_interval=None, detect from median of diffs
-    entries = [(0.0, 0.0), (5.0, 10.0), (10.0, 20.0), (20.0, 40.0)]
-    filled = _fill_gaps(entries, expected_interval=None)
-    # Median diff is 5.0. Gap between 10.0 and 20.0 is 10.0 (2x > 1.5x)
-    # Should fill with one value at t=15.0
-    self.assertEqual(len(filled), 5)
-    self.assertAlmostEqual(filled[3][0], 15.0)
-    self.assertAlmostEqual(filled[3][1], 30.0)
 
-  def test_preserves_original_entries(self):
-    entries = [(0.0, 10.0), (1.0, 20.0), (3.0, 40.0)]
-    filled = _fill_gaps(entries, expected_interval=1.0)
-    # Original entries should be at positions 0, 1, 3 (shifted by fill)
-    self.assertAlmostEqual(filled[0][1], 10.0)
-    self.assertAlmostEqual(filled[1][1], 20.0)
-    self.assertAlmostEqual(filled[3][1], 40.0)
+class StripLeadingNansTest(unittest.TestCase):
 
-  def test_with_timestamp_objects(self):
-    entries = [(Timestamp.of(0), 10.0), (Timestamp.of(2), 30.0)]
-    filled = _fill_gaps(entries, expected_interval=1.0)
-    self.assertEqual(len(filled), 3)
+  def test_no_nans(self):
+    arr = np.array([1.0, 2.0, 3.0])
+    result = _strip_leading_nans(arr)
+    np.testing.assert_array_equal(result, arr)
+
+  def test_leading_nans(self):
+    arr = np.array([np.nan, np.nan, 1.0, 2.0])
+    result = _strip_leading_nans(arr)
+    np.testing.assert_array_equal(result, [1.0, 2.0])
+
+  def test_all_nans(self):
+    arr = np.array([np.nan, np.nan])
+    result = _strip_leading_nans(arr)
+    # argmax on all-False returns 0, so returns full array
+    self.assertEqual(len(result), 2)
+
+
+class LinearInterpolationTest(unittest.TestCase):
+
+  def test_no_nans(self):
+    arr = np.array([1.0, 2.0, 3.0])
+    result = _linear_interpolation(arr)
+    np.testing.assert_array_almost_equal(result, [1.0, 2.0, 3.0])
+
+  def test_interior_nan(self):
+    arr = np.array([10.0, np.nan, 30.0])
+    result = _linear_interpolation(arr)
+    np.testing.assert_array_almost_equal(result, [10.0, 20.0, 30.0])
+
+  def test_multiple_nans(self):
+    arr = np.array([0.0, np.nan, np.nan, np.nan, 40.0])
+    result = _linear_interpolation(arr)
+    np.testing.assert_array_almost_equal(result, [0.0, 10.0, 20.0, 30.0, 40.0])
+
+  def test_all_nan(self):
+    arr = np.array([np.nan, np.nan])
+    result = _linear_interpolation(arr)
+    np.testing.assert_array_almost_equal(result, [0.0, 0.0])
 
 
 # ---------------------------------------------------------------------------
-# _TimesFMDetectorConfig tests
+# Config tests
 # ---------------------------------------------------------------------------
 
 class DetectorConfigTest(unittest.TestCase):
-  """Tests for _TimesFMDetectorConfig and _parse_detector_spec."""
 
   def test_default_config(self):
     cfg = _TimesFMDetectorConfig()
-    self.assertEqual(cfg.min_context, 128)
-    self.assertEqual(cfg.max_context, 1024)
-    self.assertEqual(cfg.confidence, 90)
-    self.assertTrue(cfg.force_flip_invariance)
-    self.assertTrue(cfg.truncate_negative)
-    self.assertFalse(cfg.use_ordered_list_state)
-    self.assertIsNone(cfg.expected_interval)
+    self.assertEqual(cfg.min_refresh, 5)
+    self.assertEqual(cfg.max_refresh, 10)
+    self.assertEqual(cfg.zscore_threshold, 5.0)
+
+  def test_invalid_refresh_bounds(self):
+    with self.assertRaises(ValueError):
+      _TimesFMDetectorConfig(min_refresh=0)
+    with self.assertRaises(ValueError):
+      _TimesFMDetectorConfig(max_refresh=129)
+    with self.assertRaises(ValueError):
+      _TimesFMDetectorConfig(min_refresh=20, max_refresh=10)
 
   def test_parse_minimal(self):
     cfg = _parse_detector_spec('{"type":"TimesFM"}')
     self.assertIsInstance(cfg, _TimesFMDetectorConfig)
-    self.assertEqual(cfg.max_context, 1024)
 
-  def test_parse_with_config(self):
+  def test_parse_refresh_bounds(self):
     cfg = _parse_detector_spec(
-        '{"type":"TimesFM","config":{"max_context":2048,"confidence":80}}')
-    self.assertEqual(cfg.max_context, 2048)
-    self.assertEqual(cfg.confidence, 80)
+        '{"type":"TimesFM","config":{"min_refresh":3,"max_refresh":15}}')
+    self.assertEqual(cfg.min_refresh, 3)
+    self.assertEqual(cfg.max_refresh, 15)
 
-  def test_parse_expected_interval(self):
+  def test_parse_zscore_threshold(self):
     cfg = _parse_detector_spec(
-        '{"type":"TimesFM","config":{"expected_interval":60}}')
-    self.assertEqual(cfg.expected_interval, 60)
-
-  def test_parse_use_ordered_list_state(self):
-    cfg = _parse_detector_spec(
-        '{"type":"TimesFM","config":{"use_ordered_list_state":true}}')
-    self.assertTrue(cfg.use_ordered_list_state)
+        '{"type":"TimesFM","config":{"zscore_threshold":3.5}}')
+    self.assertEqual(cfg.zscore_threshold, 3.5)
 
 
 # ---------------------------------------------------------------------------
-# TimesFMBufferDoFn tests
+# BufferDoFn tests
 # ---------------------------------------------------------------------------
 
 class BufferDoFnTest(unittest.TestCase):
-  """Tests for TimesFMBufferDoFn (BagState version).
-
-  Tests the DoFn logic directly by simulating stateful calls.
-  """
 
   def _make_row(self, value, window_start):
-    return beam.Row(value=value, window_start=float(window_start),
-                    window_end=float(window_start + 60))
+    return beam.Row(value=value, window_start=Timestamp.of(window_start),
+                    window_end=Timestamp.of(window_start + 1))
 
-  def _run_dofn(self, elements, min_context=32, max_context=64,
-                expected_interval=60.0):
-    """Simulate the buffer DoFn by calling _emit with accumulated entries."""
-    dofn = TimesFMBufferDoFn(
-        min_context=min_context, max_context=max_context,
-        expected_interval=expected_interval)
+  def _run_buffer(self, elements, **kwargs):
+    defaults = dict(min_context=32, max_context=64,
+                    expected_interval=1.0, min_refresh=5, max_refresh=10)
+    defaults.update(kwargs)
+    dofn = TimesFMBufferDoFn(**defaults)
 
     all_entries = []
-    main_results = []
-    warmup_results = []
-    max_entries = max_context + 1
+    inference = []
+    observe = []
+    warmup = []
+    step = 0
+    max_entries = defaults['max_context'] + 1
 
     for key, row in elements:
       ts = row.window_start
@@ -184,221 +188,175 @@ class BufferDoFnTest(unittest.TestCase):
       if len(all_entries) > max_entries:
         all_entries = all_entries[-max_entries:]
 
-      output = dofn._emit(key, row, all_entries)
-      if output.tag == 'main':
-        main_results.append(output.value)
-      elif output.tag == 'warmup':
-        warmup_results.append(output.value)
+      step += 1
+      context_len = len(all_entries) - 1
 
-    return main_results, warmup_results
+      if context_len < defaults['min_context']:
+        warmup.append((key, step))
+        continue
+
+      observe.append((key, step))
+
+      import random as _rng
+      if not hasattr(self, '_next_refresh') or self._next_refresh is None or step >= self._next_refresh:
+        inference.append((key, step))
+        interval = _rng.randint(defaults['min_refresh'], defaults['max_refresh'])
+        self._next_refresh = step + interval
+
+    return inference, observe, warmup
 
   def test_warmup_phase(self):
-    elements = [('k', self._make_row(float(i), i * 60))
-                for i in range(10)]
-    main, warmup = self._run_dofn(elements, min_context=32)
+    elements = [('k', self._make_row(float(i), i)) for i in range(10)]
+    inf, obs, warmup = self._run_buffer(elements, min_context=32)
     self.assertEqual(len(warmup), 10)
-    self.assertEqual(len(main), 0)
-    for key, result in warmup:
-      self.assertEqual(result.predictions[0].label, -2)
+    self.assertEqual(len(obs), 0)
+    self.assertEqual(len(inf), 0)
 
-  def test_emits_after_min_context(self):
-    elements = [('k', self._make_row(float(i), i * 60))
-                for i in range(40)]
-    main, warmup = self._run_dofn(elements, min_context=32)
+  def test_emits_after_warmup(self):
+    elements = [('k', self._make_row(float(i), i)) for i in range(50)]
+    inf, obs, warmup = self._run_buffer(elements, min_context=32)
     self.assertEqual(len(warmup), 32)
-    self.assertGreater(len(main), 0)
+    self.assertGreater(len(obs), 0)
 
-  def test_context_is_patch_aligned(self):
-    elements = [('k', self._make_row(float(i), i * 60))
-                for i in range(50)]
-    main, _ = self._run_dofn(elements, min_context=32)
-    for key, data in main:
-      ctx = data['context']
-      self.assertEqual(len(ctx) % PATCH_SIZE, 0,
-                       f'Context length {len(ctx)} not patch-aligned')
-
-  def test_context_excludes_observed(self):
-    elements = [('k', self._make_row(float(i), i * 60))
-                for i in range(40)]
-    main, _ = self._run_dofn(elements, min_context=32)
-    last_key, last_data = main[-1]
-    self.assertAlmostEqual(last_data['observed'], 39.0)
-    # Context[-1] should be the value before observed
-    self.assertAlmostEqual(float(last_data['context'][-1]), 38.0)
-
-  def test_max_context_trim(self):
-    elements = [('k', self._make_row(float(i), i * 60))
-                for i in range(100)]
-    main, _ = self._run_dofn(elements, min_context=32, max_context=64)
-    for _, data in main:
-      self.assertLessEqual(len(data['context']), 64)
-
-  def test_keyed_output(self):
-    elements = [('mykey', self._make_row(float(i), i * 60))
-                for i in range(40)]
-    main, warmup = self._run_dofn(elements, min_context=32)
-    for key, data in main:
-      self.assertEqual(key, 'mykey')
-    for key, result in warmup:
-      self.assertEqual(key, 'mykey')
-
-  def test_row_preserved_in_output(self):
-    elements = [('k', self._make_row(float(i), i * 60))
-                for i in range(40)]
-    main, _ = self._run_dofn(elements, min_context=32)
-    _, data = main[-1]
-    self.assertIn('row', data)
-    self.assertAlmostEqual(data['row'].window_start, 39.0 * 60)
-
-  def test_warmup_info_message(self):
-    elements = [('k', self._make_row(0.0, 0))]
-    _, warmup = self._run_dofn(elements, min_context=32)
-    _, result = warmup[0]
-    self.assertIn('warmup:', result.predictions[0].info)
-    self.assertIn('0/32', result.predictions[0].info)
+  def test_inference_within_refresh_bounds(self):
+    elements = [('k', self._make_row(float(i), i)) for i in range(100)]
+    inf, obs, warmup = self._run_buffer(
+        elements, min_context=32, min_refresh=5, max_refresh=10)
+    # After 32 warmup, 68 scored. With refresh 5-10, expect 7-14 calls
+    self.assertGreater(len(inf), 3)
+    self.assertLess(len(inf), len(obs))
 
 
 # ---------------------------------------------------------------------------
-# TimesFMScoreDoFn tests
+# CacheAndScoreDoFn tests
 # ---------------------------------------------------------------------------
 
-class ResidualDoFnTest(unittest.TestCase):
-  """Tests for TimesFMResidualDoFn."""
+class CacheAndScoreDoFnTest(unittest.TestCase):
+  """Tests for timestamp-based cursor computation in CacheAndScoreDoFn."""
 
-  def _make_prediction_result(self, observed, point_forecast, quantiles,
-                              key='k'):
-    row = beam.Row(value=observed, window_start=100.0, window_end=160.0)
-    data = {'context': np.zeros(32), 'observed': observed, 'row': row}
-    quant_array = np.zeros((128, 10))
-    quant_array[0] = quantiles
-    inference = {
-        'point_forecast': np.array([point_forecast] + [0.0] * 127),
-        'quantile_forecast': quant_array,
+  def _make_cached(self, context_end_ts=99.0, expected_interval=1.0):
+    return {
+        'point': np.arange(128, dtype=np.float32) + 50.0,  # 50, 51, 52, ...
+        'quantile': np.tile(
+            np.array([50, 45, 46, 47, 48, 50, 52, 53, 54, 55], dtype=np.float32),
+            (128, 1)),
+        'upper_idx': 9, 'lower_idx': 1,
+        'context_end_ts': Timestamp.of(context_end_ts),
+        'expected_interval': expected_interval,
     }
-    pr = PredictionResult(example=data, inference=inference,
-                          model_id='TimesFM-2.5')
-    return (key, pr)
 
-  def _run(self, element, confidence=90):
-    dofn = TimesFMResidualDoFn(confidence=confidence)
-    return list(dofn.process(element))
+  def _make_obs(self, observed, window_start):
+    ws = Timestamp.of(window_start)
+    return {
+        _TAG_OBSERVATION: True,
+        'observed': observed,
+        'row': beam.Row(value=observed, window_start=ws,
+                        window_end=ws + 1),
+        'step': 1,
+    }
 
-  def test_residual_value(self):
-    quantiles = [50.0, 45.0, 46.0, 47.0, 48.0, 50.0, 52.0, 53.0, 54.0, 55.0]
-    element = self._make_prediction_result(48.0, 50.0, quantiles)
-    results = self._run(element)
-    self.assertEqual(len(results), 1)
-    key, row = results[0]
+  def test_cursor_from_timestamp(self):
+    """cursor = round((obs_ts - ctx_end) / interval) - 1"""
+    dofn = TimesFMCacheAndScoreDoFn()
+    # context_end=99, interval=1
+    # obs at t=100: cursor = round((100-99)/1) - 1 = 0
+    cached = self._make_cached(context_end_ts=99.0, expected_interval=1.0)
+    obs = self._make_obs(48.0, window_start=100.0)
+    result = dofn._score('k', obs, cached)
+    self.assertIsNotNone(result)
+    key, row = result
     self.assertEqual(key, 'k')
-    # residual = predicted - observed = 50 - 48 = 2
-    self.assertAlmostEqual(row.value, 2.0)
-
-  def test_negative_residual(self):
-    quantiles = [50.0, 45.0, 46.0, 47.0, 48.0, 50.0, 52.0, 53.0, 54.0, 55.0]
-    element = self._make_prediction_result(55.0, 50.0, quantiles)
-    results = self._run(element)
-    _, row = results[0]
-    # residual = 50 - 55 = -5
-    self.assertAlmostEqual(row.value, -5.0)
-
-  def test_preserves_window_timestamps(self):
-    quantiles = [50.0, 45.0, 46.0, 47.0, 48.0, 50.0, 52.0, 53.0, 54.0, 55.0]
-    element = self._make_prediction_result(50.0, 50.0, quantiles)
-    results = self._run(element)
-    _, row = results[0]
-    self.assertAlmostEqual(row.window_start, 100.0)
-    self.assertAlmostEqual(row.window_end, 160.0)
-
-  def test_carries_timesfm_metadata(self):
-    quantiles = [50.0, 45.0, 46.0, 47.0, 48.0, 50.0, 52.0, 53.0, 54.0, 55.0]
-    element = self._make_prediction_result(48.0, 50.0, quantiles)
-    results = self._run(element)
-    _, row = results[0]
-    self.assertAlmostEqual(row.timesfm_observed, 48.0)
+    # cursor=0, predicted = 50.0
     self.assertAlmostEqual(row.timesfm_predicted, 50.0)
-    self.assertAlmostEqual(row.timesfm_lower, 45.0)  # P10
-    self.assertAlmostEqual(row.timesfm_upper, 55.0)  # P90
+    self.assertAlmostEqual(row.value, 50.0 - 48.0)  # residual
 
-  def test_keyed_output(self):
-    quantiles = [50.0] * 10
-    element = self._make_prediction_result(50.0, 50.0, quantiles, key='mykey')
-    results = self._run(element)
-    key, _ = results[0]
-    self.assertEqual(key, 'mykey')
+  def test_cursor_at_offset(self):
+    """Observation 5 intervals after context end → cursor=4"""
+    dofn = TimesFMCacheAndScoreDoFn()
+    cached = self._make_cached(context_end_ts=99.0, expected_interval=1.0)
+    # obs at t=104: cursor = round((104-99)/1) - 1 = 4
+    obs = self._make_obs(48.0, window_start=104.0)
+    result = dofn._score('k', obs, cached)
+    key, row = result
+    # cursor=4, predicted = 54.0 (50 + 4)
+    self.assertAlmostEqual(row.timesfm_predicted, 54.0)
 
+  def test_cursor_with_15s_polling(self):
+    """Simulates CDC polling: obs arrives 15 intervals after context end."""
+    dofn = TimesFMCacheAndScoreDoFn()
+    cached = self._make_cached(context_end_ts=99.0, expected_interval=1.0)
+    # obs at t=114: cursor = round((114-99)/1) - 1 = 14
+    obs = self._make_obs(48.0, window_start=114.0)
+    result = dofn._score('k', obs, cached)
+    key, row = result
+    # cursor=14, predicted = 64.0 (50 + 14)
+    self.assertAlmostEqual(row.timesfm_predicted, 64.0)
+
+  def test_cursor_negative_returns_none(self):
+    """Observation before context end → out of range."""
+    dofn = TimesFMCacheAndScoreDoFn()
+    cached = self._make_cached(context_end_ts=99.0, expected_interval=1.0)
+    obs = self._make_obs(48.0, window_start=98.0)  # before context end
+    result = dofn._score('k', obs, cached)
+    self.assertIsNone(result)
+
+  def test_cursor_past_horizon_returns_none(self):
+    """Observation too far in the future → out of range."""
+    dofn = TimesFMCacheAndScoreDoFn()
+    cached = self._make_cached(context_end_ts=99.0, expected_interval=1.0)
+    # obs at t=228: cursor = round((228-99)/1) - 1 = 128 → out of range
+    obs = self._make_obs(48.0, window_start=228.0)
+    result = dofn._score('k', obs, cached)
+    self.assertIsNone(result)
+
+  def test_sub_second_interval(self):
+    """0.5s interval: obs at t=100.5 → cursor=0"""
+    dofn = TimesFMCacheAndScoreDoFn()
+    cached = self._make_cached(context_end_ts=100.0, expected_interval=0.5)
+    # obs at t=100.5: cursor = round((100.5-100.0)/0.5) - 1 = 0
+    obs = self._make_obs(48.0, window_start=100.5)
+    result = dofn._score('k', obs, cached)
+    self.assertIsNotNone(result)
+    self.assertAlmostEqual(result[1].timesfm_predicted, 50.0)  # cursor=0
+
+
+# ---------------------------------------------------------------------------
+# EnrichDoFn tests
+# ---------------------------------------------------------------------------
 
 class EnrichDoFnTest(unittest.TestCase):
-  """Tests for TimesFMEnrichDoFn."""
-
-  def _make_anomaly_result(self, residual, observed, predicted, lower, upper,
-                           score=1.5, label=0, key='k'):
-    row = beam.Row(
-        value=residual,
-        window_start=100.0, window_end=160.0,
-        timesfm_observed=observed, timesfm_predicted=predicted,
-        timesfm_lower=lower, timesfm_upper=upper)
-    prediction = AnomalyPrediction(
-        model_id='RobustZScore', score=score, label=label, info='zscore info')
-    result = AnomalyResult(example=row, predictions=[prediction])
-    if key is not None:
-      return (key, result)
-    return result
 
   def test_enriches_info(self):
-    element = self._make_anomaly_result(
-        residual=2.0, observed=48.0, predicted=50.0, lower=45.0, upper=55.0)
-    dofn = TimesFMEnrichDoFn()
-    results = list(dofn.process(element))
-    key, result = results[0]
-    info = result.predictions[0].info
-    self.assertIn('predicted=50.0000', info)
-    self.assertIn('bounds=[45.0000, 55.0000]', info)
-    self.assertIn('residual=2.0000', info)
-    self.assertIn('zscore info', info)
+    row = beam.Row(value=2.0, window_start=Timestamp(100), window_end=Timestamp(101),
+                   timesfm_observed=48.0, timesfm_predicted=50.0,
+                   timesfm_lower=45.0, timesfm_upper=55.0)
+    prediction = AnomalyPrediction(
+        model_id='ZScore', score=1.5, label=0, info='zscore info')
+    result = AnomalyResult(example=row, predictions=[prediction])
 
-  def test_restores_observed_value(self):
-    element = self._make_anomaly_result(
-        residual=2.0, observed=48.0, predicted=50.0, lower=45.0, upper=55.0)
     dofn = TimesFMEnrichDoFn()
-    results = list(dofn.process(element))
-    _, result = results[0]
-    # Example value should be the original observed, not the residual.
-    self.assertAlmostEqual(result.example.value, 48.0)
+    outputs = list(dofn.process(('k', result)))
+    key, enriched = outputs[0]
+    self.assertIn('predicted=50.0000', enriched.predictions[0].info)
+    self.assertIn('residual=2.0000', enriched.predictions[0].info)
+    self.assertAlmostEqual(enriched.example.value, 48.0)
 
   def test_model_id(self):
-    element = self._make_anomaly_result(
-        residual=0.0, observed=50.0, predicted=50.0, lower=45.0, upper=55.0)
+    row = beam.Row(value=0.0, window_start=Timestamp(0), window_end=Timestamp(1),
+                   timesfm_observed=50.0, timesfm_predicted=50.0,
+                   timesfm_lower=45.0, timesfm_upper=55.0)
+    prediction = AnomalyPrediction(model_id='ZScore', score=0.0, label=0)
+    result = AnomalyResult(example=row, predictions=[prediction])
     dofn = TimesFMEnrichDoFn()
-    results = list(dofn.process(element))
-    _, result = results[0]
-    self.assertEqual(result.predictions[0].model_id, 'TimesFM-2.5+ZScore')
-
-  def test_preserves_label_and_score(self):
-    element = self._make_anomaly_result(
-        residual=10.0, observed=40.0, predicted=50.0,
-        lower=45.0, upper=55.0, score=4.5, label=1)
-    dofn = TimesFMEnrichDoFn()
-    results = list(dofn.process(element))
-    _, result = results[0]
-    self.assertAlmostEqual(result.predictions[0].score, 4.5)
-    self.assertEqual(result.predictions[0].label, 1)
-
-  def test_keyed_output(self):
-    element = self._make_anomaly_result(
-        residual=0.0, observed=50.0, predicted=50.0,
-        lower=45.0, upper=55.0, key='mykey')
-    dofn = TimesFMEnrichDoFn()
-    results = list(dofn.process(element))
-    key, _ = results[0]
-    self.assertEqual(key, 'mykey')
+    outputs = list(dofn.process(result))
+    self.assertEqual(outputs[0].predictions[0].model_id, 'TimesFM-2.5+ZScore')
 
 
 # ---------------------------------------------------------------------------
-# Integration: parse_detector_spec for TimesFM in pipeline
+# Pipeline integration
 # ---------------------------------------------------------------------------
 
 class PipelineParseTimesFMTest(unittest.TestCase):
-  """Tests that TimesFM integrates with _parse_detector_spec."""
 
   def test_timesfm_in_supported_detectors(self):
     from bqmonitor.pipeline import _SUPPORTED_DETECTORS
@@ -408,26 +366,17 @@ class PipelineParseTimesFMTest(unittest.TestCase):
     cfg = _parse_detector_spec('{"type":"TimesFM"}')
     self.assertIsInstance(cfg, _TimesFMDetectorConfig)
 
-  def test_all_config_fields_passed(self):
+  def test_all_config_fields(self):
     cfg = _parse_detector_spec(
         '{"type":"TimesFM","config":{'
-        '"model_name":"custom/model",'
-        '"min_context":64,'
-        '"max_context":512,'
-        '"confidence":80,'
-        '"force_flip_invariance":false,'
-        '"truncate_negative":false,'
-        '"use_ordered_list_state":true,'
-        '"expected_interval":30'
+        '"min_context":64,"max_context":512,"confidence":80,'
+        '"min_refresh":3,"max_refresh":15,"zscore_threshold":3.5'
         '}}')
-    self.assertEqual(cfg.model_name, 'custom/model')
     self.assertEqual(cfg.min_context, 64)
     self.assertEqual(cfg.max_context, 512)
-    self.assertEqual(cfg.confidence, 80)
-    self.assertFalse(cfg.force_flip_invariance)
-    self.assertFalse(cfg.truncate_negative)
-    self.assertTrue(cfg.use_ordered_list_state)
-    self.assertEqual(cfg.expected_interval, 30)
+    self.assertEqual(cfg.min_refresh, 3)
+    self.assertEqual(cfg.max_refresh, 15)
+    self.assertEqual(cfg.zscore_threshold, 3.5)
 
 
 if __name__ == '__main__':

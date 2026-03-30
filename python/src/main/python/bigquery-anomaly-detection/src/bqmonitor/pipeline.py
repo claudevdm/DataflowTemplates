@@ -246,7 +246,7 @@ from apache_beam.ml.anomaly.detectors import robust_zscore  # noqa: F401
 
 _LOGGER = logging.getLogger(__name__)
 
-_SUPPORTED_DETECTORS = ('ZScore', 'IQR', 'RobustZScore')
+_SUPPORTED_DETECTORS = ('ZScore', 'IQR', 'RobustZScore', 'TimesFM')
 
 # Matches project:dataset.table or project.dataset.table
 _TABLE_RE = re.compile(
@@ -333,12 +333,8 @@ class _LogAnomalyResult(beam.DoFn):
     else:
       tag = 'WARMUP'
 
-    ws = datetime.datetime.fromtimestamp(
-        example.window_start, tz=datetime.timezone.utc).strftime(
-            '%Y-%m-%dT%H:%M:%S.%fZ')
-    we = datetime.datetime.fromtimestamp(
-        example.window_end, tz=datetime.timezone.utc).strftime(
-            '%Y-%m-%dT%H:%M:%S.%fZ')
+    ws = example.window_start.to_rfc3339()
+    we = example.window_end.to_rfc3339()
     window_str = f'{ws}-{we}'
 
     if key is not None:
@@ -408,12 +404,8 @@ class _FormatAnomalyAsJson(beam.DoFn):
       return
 
     example = result.example
-    ws = datetime.datetime.fromtimestamp(
-        example.window_start, tz=datetime.timezone.utc).strftime(
-            '%Y-%m-%dT%H:%M:%S.%fZ')
-    we = datetime.datetime.fromtimestamp(
-        example.window_end, tz=datetime.timezone.utc).strftime(
-            '%Y-%m-%dT%H:%M:%S.%fZ')
+    ws = example.window_start.to_rfc3339()
+    we = example.window_end.to_rfc3339()
 
     payload = {
         'event_description': (
@@ -435,6 +427,7 @@ _SINK_SCHEMA = {
         {'name': 'value', 'type': 'FLOAT64', 'mode': 'REQUIRED'},
         {'name': 'score', 'type': 'FLOAT64', 'mode': 'NULLABLE'},
         {'name': 'label', 'type': 'INT64', 'mode': 'REQUIRED'},
+        {'name': 'info', 'type': 'STRING', 'mode': 'NULLABLE'},
         {'name': 'key', 'type': 'STRING', 'mode': 'NULLABLE'},
     ]
 }
@@ -448,14 +441,13 @@ class _FormatResultForBQ(beam.DoFn):
     example = result.example
 
     row = {
-        'window_start': datetime.datetime.fromtimestamp(
-            example.window_start, tz=datetime.timezone.utc).isoformat(),
-        'window_end': datetime.datetime.fromtimestamp(
-            example.window_end, tz=datetime.timezone.utc).isoformat(),
+        'window_start': example.window_start.to_rfc3339(),
+        'window_end': example.window_end.to_rfc3339(),
         'value': float(example.value),
         'score': float(prediction.score) if prediction.score is not None
         else None,
         'label': int(prediction.label),
+        'info': prediction.info if prediction.info else None,
     }
     if key is not None:
       row['key'] = str(key)
@@ -738,6 +730,24 @@ def _parse_detector_spec(json_str):
           "It will receive the computed metric value as 'value'.", expr_text)
     return _ThresholdAlert(expr_text)
 
+  if detector_type == 'TimesFM':
+    from bqmonitor.timesfm_detector import _TimesFMDetectorConfig
+    config = d.get('config', {})
+    return _TimesFMDetectorConfig(
+        model_name=config.get(
+            'model_name', 'google/timesfm-2.5-200m-transformers'),
+        min_context=config.get('min_context', 128),
+        max_context=config.get('max_context', 1024),
+        confidence=config.get('confidence', 90),
+        force_flip_invariance=config.get('force_flip_invariance', True),
+        truncate_negative=config.get('truncate_negative', True),
+        use_ordered_list_state=config.get('use_ordered_list_state', False),
+        expected_interval=config.get('expected_interval', None),
+        zscore_threshold=config.get('zscore_threshold', 5.0),
+        min_refresh=config.get('min_refresh', 5),
+        max_refresh=config.get('max_refresh', 10),
+    )
+
   if detector_type not in _SUPPORTED_DETECTORS:
     raise ValueError(
         f"Unknown detector type '{detector_type}'. "
@@ -1012,13 +1022,194 @@ def build_pipeline(pipeline, options, metric_spec, detector):
 
   # Rewindow into GlobalWindows so the anomaly detector sees the full
   # stream of window results as a time series, not isolated per-window.
+  # The trigger fires on every element so the watermark advances
+  # incrementally, allowing event-time timers in downstream stateful
+  # DoFns to fire promptly.
   from apache_beam.transforms.window import GlobalWindows
-  global_metrics = metrics | 'Rewindow' >> beam.WindowInto(GlobalWindows())
+  from apache_beam.transforms.trigger import Repeatedly
+  from apache_beam.transforms.trigger import AfterCount
+  from apache_beam.transforms.trigger import AccumulationMode
+  global_metrics = metrics | 'Rewindow' >> beam.WindowInto(
+      GlobalWindows())
+  # ,
+  #     trigger=Repeatedly(AfterCount(1)),
+  #     accumulation_mode=AccumulationMode.DISCARDING)
 
-  if isinstance(detector, _ThresholdAlert):
+  # For sliding windows, prepend the window offset to the key so that
+  # each offset is detected independently. This ensures that stateful
+  # detectors (ZScore, IQR, RobustZScore, TimesFM) only see values from
+  # the same non-overlapping sub-series. For example, size=60 period=30
+  # produces offsets 0 and 30 — key "K" becomes ("K", 0) and ("K", 30).
+  # Fixed windows have only one offset (0), so no change needed.
+  # Threshold is stateless, so no offset keying needed.
+  _sliding_offset_applied = False
+  is_sliding = (metric_spec.aggregation.window.type.value == 'sliding')
+  if is_sliding and not isinstance(detector, _ThresholdAlert):
+    window_size = metric_spec.aggregation.window.size_seconds
+    slide_period = metric_spec.aggregation.window.period_seconds
+    n_offsets = window_size // slide_period
+    _LOGGER.info(
+        'Sliding window detected (size=%ds, period=%ds, %d offsets). '
+        'Adding offset key for independent per-offset detection.',
+        window_size, slide_period, n_offsets)
+    _sliding_offset_applied = True
+
+    def _add_offset_key(element, _ws=window_size):
+      if isinstance(element, tuple) and len(element) == 2:
+        key, row = element
+        offset = round(float(row.window_start % _ws), 3)
+        return ((key, offset), row)
+      else:
+        row = element
+        offset = round(float(row.window_start % _ws), 3)
+        return (offset, row)
+
+    global_metrics = (
+        global_metrics | 'AddOffsetKey' >> beam.Map(_add_offset_key))
+
+  # Late import to avoid pulling in torch/transformers unless needed.
+  from bqmonitor.timesfm_detector import _TimesFMDetectorConfig
+
+  if isinstance(detector, _TimesFMDetectorConfig):
+    from bqmonitor.timesfm_detector import (
+        TimesFMModelHandler, TimesFMBufferDoFn, TimesFMBufferDoFnOLS,
+        TimesFMExtractPredictionsDoFn, TimesFMCacheAndScoreDoFn,
+        TimesFMEnrichDoFn)
+    from apache_beam.ml.inference.base import KeyedModelHandler
+    from apache_beam.ml.inference.base import RunInference
+
+    # Stateful DoFns require keyed input. If ComputeMetric produced
+    # unkeyed beam.Row elements (no group_by) AND we didn't already add
+    # an offset key for sliding windows, wrap them with a global key.
+    _timesfm_unkeyed = (not metric_spec.aggregation.group_by
+                        and not _sliding_offset_applied)
+    if _timesfm_unkeyed:
+      global_metrics = (
+          global_metrics
+          | 'AddGlobalKey' >> beam.Map(lambda row: (None, row)))
+
+    # Derive expected_interval from the metric window config if not set.
+    # With sliding window offset keying, each offset sub-series is spaced
+    # by size_seconds. For fixed windows it's also size_seconds.
+    expected_interval = detector.expected_interval
+    if expected_interval is None:
+      expected_interval = float(metric_spec.aggregation.window.size_seconds)
+      _LOGGER.info(
+          'TimesFM: expected_interval=%.1fs (from metric window size)',
+          expected_interval)
+
+    handler = TimesFMModelHandler(
+        model_name=detector.model_name,
+        expected_interval=expected_interval,
+        force_flip_invariance=detector.force_flip_invariance,
+        truncate_negative=detector.truncate_negative,
+    )
+    _verbose = options.log_all_results.lower() == 'true'
+    buffer_cls = (TimesFMBufferDoFnOLS if detector.use_ordered_list_state
+                  else TimesFMBufferDoFn)
+    buffered = (
+        global_metrics
+        | 'TimesFMBuffer' >> beam.ParDo(
+            buffer_cls(
+                min_context=detector.min_context,
+                max_context=detector.max_context,
+                confidence=detector.confidence,
+                expected_interval=expected_interval,
+                min_refresh=detector.min_refresh,
+                max_refresh=detector.max_refresh,
+                verbose=_verbose,
+            )
+        ).with_outputs('inference', 'observe', 'warmup')
+    )
+
+    # Step 1: Run TimesFM inference (only every refresh_every steps).
+    predictions = (
+        buffered.inference
+        | 'TimesFMForecast' >> RunInference(KeyedModelHandler(handler))
+        | 'TimesFMExtract' >> beam.ParDo(
+            TimesFMExtractPredictionsDoFn(confidence=detector.confidence))
+    )
+
+    # Step 2: Merge predictions + observations into stateful scorer.
+    # CacheAndScoreDoFn caches predictions and scores each observation
+    # against the cached forecast, emitting residual beam.Rows.
+    merged = (
+        (predictions, buffered.observe)
+        | 'MergePredObs' >> beam.Flatten()
+    )
+    residuals = (
+        merged
+        | 'TimesFMCacheScore' >> beam.ParDo(
+            TimesFMCacheAndScoreDoFn(verbose=_verbose))
+    )
+
+    # Step 3: Feed residuals into ZScore to detect anomalous errors.
+    # Strip keys before AnomalyDetection (ZScore operates on global
+    # residual distribution; all keys share the same model).
+    unkeyed_residuals = residuals | 'StripKeyForZScore' >> beam.Map(
+        lambda kv: kv[1] if isinstance(kv, tuple) else kv)
+    from apache_beam.ml.anomaly.detectors import zscore as _zs  # noqa
+    residual_detector = Specifiable.from_spec(
+        _dict_to_spec({
+            'type': 'ZScore',
+            'config': {
+                'features': ['value'],
+                'threshold_criterion': {
+                    'type': 'FixedThreshold',
+                    'config': {'cutoff': detector.zscore_threshold},
+                },
+            },
+        }),
+        _run_init=True)
+    residual_anomalies = (
+        unkeyed_residuals
+        | 'DetectResidualAnomalies' >> AnomalyDetection(residual_detector)
+    )
+
+    # Step 4: Enrich the ZScore result with TimesFM prediction metadata.
+    scored = (
+        residual_anomalies
+        | 'TimesFMEnrich' >> beam.ParDo(
+            TimesFMEnrichDoFn(verbose=_verbose))
+    )
+
+    # Strip warmup keys to match unkeyed scored output.
+    unkeyed_warmup = (
+        buffered.warmup
+        | 'StripWarmupKey' >> beam.Map(
+            lambda el: el[1] if isinstance(el, tuple) else el))
+
+    anomalies = (
+        (scored, unkeyed_warmup)
+        | 'MergeTimesFM' >> beam.Flatten()
+    )
+
+  elif isinstance(detector, _ThresholdAlert):
     anomalies = global_metrics | 'DetectAnomalies' >> beam.ParDo(detector)
   else:
     anomalies = global_metrics | 'DetectAnomalies' >> AnomalyDetection(detector)
+
+  # Strip the offset from the key if we added it for sliding windows,
+  # so downstream sinks see the original key.
+  # - With group_by: key is (original_key, offset) → restore to (original_key, result)
+  # - Without group_by: key is just offset (float) → strip entirely to plain result
+  if _sliding_offset_applied:
+    has_group_by = bool(metric_spec.aggregation.group_by)
+
+    def _strip_offset_key(element, _has_group_by=has_group_by):
+      if not isinstance(element, tuple) or len(element) != 2:
+        return element
+      key, result = element
+      if _has_group_by and isinstance(key, tuple) and len(key) == 2:
+        original_key = key[0]
+        return (original_key, result)
+      elif not _has_group_by:
+        # Key is just the offset (float) — strip it entirely.
+        return result
+      return element
+
+    anomalies = (
+        anomalies | 'StripOffsetKey' >> beam.Map(_strip_offset_key))
 
   if options.log_all_results.lower() == 'true':
     _ = anomalies | 'LogResults' >> beam.ParDo(_LogAnomalyResult())
@@ -1068,6 +1259,13 @@ def run(argv=None):
   _preflight_checks(monitor_options, metric_spec)
 
   options.view_as(SetupOptions).save_main_session = True
+
+  # This pipeline uses event-time timers and SDF-based CDC polling,
+  # both of which require streaming mode for correct watermark
+  # advancement. Without this, timers may not fire until pipeline
+  # completion (batch semantics).
+  from apache_beam.options.pipeline_options import StandardOptions
+  options.view_as(StandardOptions).streaming = True
 
   with beam.Pipeline(options=options) as p:
     build_pipeline(p, monitor_options, metric_spec, detector)

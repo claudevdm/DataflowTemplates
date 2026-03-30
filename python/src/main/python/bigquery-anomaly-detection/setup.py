@@ -10,5 +10,7 @@ setup(
     install_requires=[
         'apache-beam[gcp]',
         'google-cloud-bigquery-storage',
+        'transformers>=5.3.0',
+        'torch',
     ],
 )
