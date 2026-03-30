@@ -222,6 +222,7 @@ import json
 import logging
 import re
 import time
+from typing import Any
 
 import apache_beam as beam
 from apache_beam.io.gcp.bigquery import WriteToBigQuery
@@ -746,6 +747,7 @@ def _parse_detector_spec(json_str):
         zscore_threshold=config.get('zscore_threshold', 5.0),
         min_refresh=config.get('min_refresh', 5),
         max_refresh=config.get('max_refresh', 10),
+        model_gcs_path=config.get('model_gcs_path', 'auto'),
     )
 
   if detector_type not in _SUPPORTED_DETECTORS:
@@ -951,6 +953,54 @@ def _check_pubsub_topic(topic_path):
         topic_path, e)
 
 
+def _stage_model_to_gcs(model_name, gcs_path):
+  """Download a HuggingFace model locally and upload to GCS.
+
+  Runs once on the pipeline launcher. Workers then load from GCS
+  instead of downloading from HuggingFace Hub independently.
+
+  Args:
+    model_name: HuggingFace model ID (e.g. 'google/timesfm-2.5-200m-transformers').
+    gcs_path: GCS destination (e.g. 'gs://bucket/models/timesfm').
+
+  Returns:
+    The GCS path for workers to load from.
+  """
+  import subprocess
+
+  # Check if model is already staged
+  result = subprocess.run(
+      ['gsutil', 'ls', f'{gcs_path}/config.json'],
+      capture_output=True, text=True)
+  if result.returncode == 0:
+    _LOGGER.info('[ModelStaging] Model already staged at %s', gcs_path)
+    return gcs_path
+
+  _LOGGER.info('[ModelStaging] Staging %s to %s', model_name, gcs_path)
+
+  # Download from HuggingFace to local cache
+  from transformers import TimesFm2_5ModelForPrediction
+  import os
+  model = TimesFm2_5ModelForPrediction.from_pretrained(model_name)
+  cache_dir = os.path.expanduser('~/.cache/huggingface/hub')
+  safe_name = model_name.replace('/', '--')
+  snapshots_dir = os.path.join(cache_dir, f'models--{safe_name}', 'snapshots')
+  if os.path.exists(snapshots_dir):
+    versions = os.listdir(snapshots_dir)
+    if versions:
+      local_path = os.path.join(snapshots_dir, versions[0])
+      _LOGGER.info('[ModelStaging] Uploading from %s', local_path)
+      subprocess.run(
+          ['gsutil', '-m', 'cp', '-r', f'{local_path}/*', f'{gcs_path}/'],
+          capture_output=True, check=True)
+      _LOGGER.info('[ModelStaging] Model staged at %s', gcs_path)
+      return gcs_path
+
+  _LOGGER.warning('[ModelStaging] Could not find cached model, '
+                  'falling back to HuggingFace Hub')
+  return model_name
+
+
 # ---------------------------------------------------------------------------
 # Pipeline construction
 # ---------------------------------------------------------------------------
@@ -1098,8 +1148,31 @@ def build_pipeline(pipeline, options, metric_spec, detector):
           'TimesFM: expected_interval=%.1fs (from metric window size)',
           expected_interval)
 
+    # Resolve model path: if model_gcs_path is set, stage the model
+    # to GCS so workers load from there instead of HuggingFace Hub.
+    # This avoids 100+ parallel downloads at scale.
+    # Use "auto" to derive the path from --staging_location.
+    model_name = detector.model_name
+    if detector.model_gcs_path:
+      gcs_path = detector.model_gcs_path
+      if gcs_path == 'auto':
+        from apache_beam.options.pipeline_options import GoogleCloudOptions
+        staging = pipeline.options.view_as(GoogleCloudOptions).staging_location
+        if staging:
+          safe_name = detector.model_name.replace('/', '_')
+          gcs_path = f'{staging.rstrip("/")}/models/{safe_name}'
+        else:
+          _LOGGER.warning(
+              '[TimesFM] model_gcs_path=auto but no --staging_location '
+              'set. Falling back to HuggingFace Hub.')
+          gcs_path = None
+      if gcs_path:
+        model_name = _stage_model_to_gcs(
+            detector.model_name, gcs_path)
+        _LOGGER.warning('[TimesFM] Using model from %s', model_name)
+
     handler = TimesFMModelHandler(
-        model_name=detector.model_name,
+        model_name=model_name,
         expected_interval=expected_interval,
         force_flip_invariance=detector.force_flip_invariance,
         truncate_negative=detector.truncate_negative,
@@ -1144,10 +1217,11 @@ def build_pipeline(pipeline, options, metric_spec, detector):
     )
 
     # Step 3: Feed residuals into ZScore to detect anomalous errors.
-    # Strip keys before AnomalyDetection (ZScore operates on global
-    # residual distribution; all keys share the same model).
-    unkeyed_residuals = residuals | 'StripKeyForZScore' >> beam.Map(
-        lambda kv: kv[1] if isinstance(kv, tuple) else kv)
+    # AnomalyDetection detects keyed input via TupleConstraint type
+    # hint — add it so each key gets independent ZScore state.
+    keyed_residuals = residuals | 'TypeHintResiduals' >> beam.Map(
+        lambda x: x).with_output_types(tuple[Any, beam.Row])
+
     from apache_beam.ml.anomaly.detectors import zscore as _zs  # noqa
     residual_detector = Specifiable.from_spec(
         _dict_to_spec({
@@ -1162,25 +1236,20 @@ def build_pipeline(pipeline, options, metric_spec, detector):
         }),
         _run_init=True)
     residual_anomalies = (
-        unkeyed_residuals
+        keyed_residuals
         | 'DetectResidualAnomalies' >> AnomalyDetection(residual_detector)
     )
 
     # Step 4: Enrich the ZScore result with TimesFM prediction metadata.
+    # EnrichDoFn recovers the original key from _original_key.
     scored = (
         residual_anomalies
         | 'TimesFMEnrich' >> beam.ParDo(
             TimesFMEnrichDoFn(verbose=_verbose))
     )
 
-    # Strip warmup keys to match unkeyed scored output.
-    unkeyed_warmup = (
-        buffered.warmup
-        | 'StripWarmupKey' >> beam.Map(
-            lambda el: el[1] if isinstance(el, tuple) else el))
-
     anomalies = (
-        (scored, unkeyed_warmup)
+        (scored, buffered.warmup)
         | 'MergeTimesFM' >> beam.Flatten()
     )
 
