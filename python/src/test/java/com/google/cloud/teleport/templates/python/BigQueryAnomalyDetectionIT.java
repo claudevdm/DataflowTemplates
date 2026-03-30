@@ -570,7 +570,7 @@ public final class BigQueryAnomalyDetectionIT extends TemplateTestBase {
             + "\"agg\":\"SUM\",\"alias\":\"total\"}]}}";
     String detectorSpec =
         "{\"type\":\"TimesFM\",\"config\":{"
-            + "\"min_context\":32,"
+            + "\"min_context\":128,"
             + "\"max_context\":192,"
             + "\"confidence\":90,"
             + "\"force_flip_invariance\":false}}";
@@ -621,14 +621,14 @@ public final class BigQueryAnomalyDetectionIT extends TemplateTestBase {
     // Normal: rate oscillates 50-150 rows/sec (sine period=60s),
     //   each row value ~$10 → window SUM ranges ~500-1500.
     // Anomaly: 5x rate spike + 5x value → SUM jumps to ~25000.
-    int baseRate = 100;       // rows/sec at baseline
-    int rateAmplitude = 50;   // ±50 rows/sec sine amplitude
+    int baseRate = 100; // rows/sec at baseline
+    int rateAmplitude = 50; // ±50 rows/sec sine amplitude
     double sinePeriodSec = 60.0;
     double rowValueMean = 10.0;
     double rowValueStd = 2.0;
     double anomalyRateMult = 5.0;
     double anomalyValueMean = 50.0;
-    int anomalyAfterSec = 300;   // inject after 5 minutes (well past 32s warmup + ZScore baseline)
+    int anomalyAfterSec = 300; // inject after 5 minutes (well past 32s warmup + ZScore baseline)
     int anomalyDurationSec = 5;
 
     AtomicBoolean stopInserting = new AtomicBoolean(false);
@@ -656,14 +656,12 @@ public final class BigQueryAnomalyDetectionIT extends TemplateTestBase {
                   double t = second;
 
                   // Compute rate for this second (sine-driven).
-                  double sineRate =
-                      rateAmplitude * Math.sin(2 * Math.PI * t / sinePeriodSec);
+                  double sineRate = rateAmplitude * Math.sin(2 * Math.PI * t / sinePeriodSec);
                   int currentRate = Math.max(1, (int) (baseRate + sineRate));
 
                   // Check anomaly window.
                   boolean isAnomaly =
-                      second >= anomalyAfterSec
-                          && second < anomalyAfterSec + anomalyDurationSec;
+                      second >= anomalyAfterSec && second < anomalyAfterSec + anomalyDurationSec;
 
                   double valueMean;
                   if (isAnomaly) {
@@ -679,17 +677,11 @@ public final class BigQueryAnomalyDetectionIT extends TemplateTestBase {
                   for (int i = 0; i < currentRate; i++) {
                     double frac = (double) i / currentRate;
                     Instant rowTs = batchTs.plusMillis((long) (frac * 1000));
-                    double value =
-                        Math.max(0, valueMean + rng.nextGaussian() * rowValueStd);
+                    double value = Math.max(0, valueMean + rng.nextGaussian() * rowValueStd);
                     rows.add(
                         RowToInsert.of(
                             ImmutableMap.of(
-                                "ts",
-                                rowTs.toString(),
-                                "key",
-                                "sensor_1",
-                                "value",
-                                value)));
+                                "ts", rowTs.toString(), "key", "sensor_1", "value", value)));
                   }
                   bigQueryResourceManager.write(tableName, rows);
                   totalRows += currentRate;
@@ -713,9 +705,7 @@ public final class BigQueryAnomalyDetectionIT extends TemplateTestBase {
                   }
                 }
 
-                LOG.info(
-                    "Data insertion stopped after {} seconds ({} rows)",
-                    second, totalRows);
+                LOG.info("Data insertion stopped after {} seconds ({} rows)", second, totalRows);
               } catch (InterruptedException e) {
                 LOG.info("Data insertion thread interrupted");
                 Thread.currentThread().interrupt();
