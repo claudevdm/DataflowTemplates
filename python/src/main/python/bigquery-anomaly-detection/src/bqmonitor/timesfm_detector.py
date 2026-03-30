@@ -378,11 +378,28 @@ class TimesFMBufferDoFn(beam.DoFn):
         all_rows = sorted(rows_bag.read(), key=lambda x: x[0])
         row_by_ts = {ts: r for ts, r in all_rows}
 
-        # Trim buffer to max_context
-        max_entries = self._max_context + 1
-        if len(all_entries) > max_entries:
-            cutoff_ts = all_entries[-max_entries][0]
-            all_entries = all_entries[-max_entries:]
+        # Everything with ts > last_processed and ts <= fire_timestamp
+        # is safe to process (watermark guarantees completeness).
+        unprocessed = [(ts, v) for ts, v in all_entries
+                       if ts > lp and ts <= fire_timestamp]
+
+        # Trim: keep max_context entries before the oldest unprocessed
+        # element (so it has full context for inference), plus all
+        # unprocessed and future entries. Only already-processed entries
+        # beyond max_context distance are discarded.
+        # This prevents the trim from starving the timer chain of context
+        # when it's catching up through a large backlog.
+        if unprocessed:
+            oldest_unprocessed_idx = next(
+                i for i, (ts, _) in enumerate(all_entries)
+                if ts == unprocessed[0][0])
+            trim_start = max(0, oldest_unprocessed_idx - self._max_context)
+        else:
+            trim_start = max(0, len(all_entries) - self._max_context)
+
+        if trim_start > 0:
+            cutoff_ts = all_entries[trim_start][0]
+            all_entries = all_entries[trim_start:]
             buffer_bag.clear()
             for entry in all_entries:
                 buffer_bag.add(entry)
@@ -390,11 +407,6 @@ class TimesFMBufferDoFn(beam.DoFn):
             rows_bag.clear()
             for entry in all_rows:
                 rows_bag.add(entry)
-
-        # Everything with ts > last_processed and ts <= fire_timestamp
-        # is safe to process (watermark guarantees completeness).
-        unprocessed = [(ts, v) for ts, v in all_entries
-                       if ts > lp and ts <= fire_timestamp]
 
         if not unprocessed:
             return
@@ -551,14 +563,22 @@ class TimesFMBufferDoFnOLS(beam.DoFn):
         all_rows = list(rows.read())
         row_by_ts = {ts: r for ts, r in all_rows}
 
-        max_entries = self._max_context + 1
-        if len(all_entries) > max_entries:
-            cutoff_ts = all_entries[-max_entries][0]
-            buffer.clear_range(Timestamp(0), cutoff_ts)
-            all_entries = all_entries[-max_entries:]
-
         unprocessed = [(ts, v) for ts, v in all_entries
                        if ts > lp and ts <= fire_timestamp]
+
+        # Trim: keep max_context entries before the oldest unprocessed.
+        if unprocessed:
+            oldest_unprocessed_idx = next(
+                i for i, (ts, _) in enumerate(all_entries)
+                if ts == unprocessed[0][0])
+            trim_start = max(0, oldest_unprocessed_idx - self._max_context)
+        else:
+            trim_start = max(0, len(all_entries) - self._max_context)
+
+        if trim_start > 0:
+            cutoff_ts = all_entries[trim_start][0]
+            buffer.clear_range(Timestamp(0), cutoff_ts)
+            all_entries = all_entries[trim_start:]
 
         if not unprocessed:
             return

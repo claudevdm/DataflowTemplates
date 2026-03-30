@@ -570,7 +570,7 @@ public final class BigQueryAnomalyDetectionIT extends TemplateTestBase {
             + "\"agg\":\"SUM\",\"alias\":\"total\"}]}}";
     String detectorSpec =
         "{\"type\":\"TimesFM\",\"config\":{"
-            + "\"min_context\":128,"
+            + "\"min_context\":32,"
             + "\"max_context\":192,"
             + "\"confidence\":90,"
             + "\"force_flip_invariance\":false}}";
@@ -612,20 +612,24 @@ public final class BigQueryAnomalyDetectionIT extends TemplateTestBase {
     LOG.info("Waiting 5 minutes for pipeline startup...");
     TimeUnit.MINUTES.sleep(5);
 
-    // Insert sine wave data in a background thread. The thread runs
-    // continuously (baseline + repeated anomaly spikes) until stopped
-    // by the main thread once the Pub/Sub condition is met.
-    double amplitude = 100.0;
-    double baseline = 500.0;
-    double sinePeriodSec = 60.0; // 1-minute cycle
-    int rowsPerSubBatch = 10;
-    int subBatchesPerSec = 10; // 10 sub-batches × 10 rows = 100 rows/sec
-    long subBatchIntervalMs = 1000 / subBatchesPerSec; // 100ms
-    int rowsPerSec = rowsPerSubBatch * subBatchesPerSec;
-    // Per-row noise so that windowed SUM has noise_std ≈ 5.
-    // With 100 rows/window: per_row_std = 5 * sqrt(100) / 100 = 0.5.
-    double noiseStd = 0.5;
-    double anomalyMultiplier = 5.0;
+    // Insert data with a rate-driven seasonal pattern. The sine wave
+    // emerges from varying the NUMBER of rows per second, not from
+    // scaling per-row values. Each row has a realistic fixed value
+    // (~$10 ± noise). When aggregated by SUM over time windows, the
+    // seasonal pattern appears naturally.
+    //
+    // Normal: rate oscillates 50-150 rows/sec (sine period=60s),
+    //   each row value ~$10 → window SUM ranges ~500-1500.
+    // Anomaly: 5x rate spike + 5x value → SUM jumps to ~25000.
+    int baseRate = 100;       // rows/sec at baseline
+    int rateAmplitude = 50;   // ±50 rows/sec sine amplitude
+    double sinePeriodSec = 60.0;
+    double rowValueMean = 10.0;
+    double rowValueStd = 2.0;
+    double anomalyRateMult = 5.0;
+    double anomalyValueMean = 50.0;
+    int anomalyAfterSec = 300;   // inject after 5 minutes (well past 32s warmup + ZScore baseline)
+    int anomalyDurationSec = 5;
 
     AtomicBoolean stopInserting = new AtomicBoolean(false);
 
@@ -639,60 +643,79 @@ public final class BigQueryAnomalyDetectionIT extends TemplateTestBase {
                 int second = 0;
 
                 LOG.info(
-                    "Starting data insertion: {} rows/sec ({} x {}ms sub-batches), "
-                        + "period={}s, amplitude={}, baseline={}",
-                    rowsPerSec,
-                    rowsPerSubBatch,
-                    subBatchIntervalMs,
+                    "Starting rate-driven insertion: base_rate={}, "
+                        + "rate_amplitude={}, period={}s, row_value={}±{}",
+                    baseRate,
+                    rateAmplitude,
                     sinePeriodSec,
-                    amplitude,
-                    baseline);
+                    rowValueMean,
+                    rowValueStd);
 
                 while (!stopInserting.get()) {
+                  long batchStart = System.currentTimeMillis();
                   double t = second;
-                  boolean isAnomaly = false;
-                  double sineVal = amplitude * Math.sin(2 * Math.PI * t / sinePeriodSec) + baseline;
 
-                  // Inject anomaly spike every 5 minutes for 2 seconds.
-                  if (second > 0 && second % 300 < 2) {
-                    sineVal = (amplitude + baseline) * anomalyMultiplier;
-                    isAnomaly = true;
+                  // Compute rate for this second (sine-driven).
+                  double sineRate =
+                      rateAmplitude * Math.sin(2 * Math.PI * t / sinePeriodSec);
+                  int currentRate = Math.max(1, (int) (baseRate + sineRate));
+
+                  // Check anomaly window.
+                  boolean isAnomaly =
+                      second >= anomalyAfterSec
+                          && second < anomalyAfterSec + anomalyDurationSec;
+
+                  double valueMean;
+                  if (isAnomaly) {
+                    currentRate = (int) (currentRate * anomalyRateMult);
+                    valueMean = anomalyValueMean;
+                  } else {
+                    valueMean = rowValueMean;
                   }
 
-                  double perRow = sineVal / (rowsPerSec * windowSizeSec);
-
-                  // Insert sub-batches spread across the second.
-                  for (int sub = 0; sub < subBatchesPerSec && !stopInserting.get(); sub++) {
-                    List<RowToInsert> rows = new ArrayList<>();
-                    Instant subBatchTs =
-                        startTime.plusSeconds(second).plusMillis(sub * subBatchIntervalMs);
-                    for (int i = 0; i < rowsPerSubBatch; i++) {
-                      double frac = (double) i / rowsPerSubBatch;
-                      Instant rowTs = subBatchTs.plusMillis((long) (frac * subBatchIntervalMs));
-                      double value = perRow + rng.nextGaussian() * noiseStd;
-                      rows.add(
-                          RowToInsert.of(
-                              ImmutableMap.of(
-                                  "ts", rowTs.toString(), "key", "sensor_1", "value", value)));
-                    }
-                    bigQueryResourceManager.write(tableName, rows);
-                    totalRows += rowsPerSubBatch;
-                    TimeUnit.MILLISECONDS.sleep(subBatchIntervalMs);
+                  // Generate rows with timestamps spread across the second.
+                  List<RowToInsert> rows = new ArrayList<>();
+                  Instant batchTs = startTime.plusSeconds(second);
+                  for (int i = 0; i < currentRate; i++) {
+                    double frac = (double) i / currentRate;
+                    Instant rowTs = batchTs.plusMillis((long) (frac * 1000));
+                    double value =
+                        Math.max(0, valueMean + rng.nextGaussian() * rowValueStd);
+                    rows.add(
+                        RowToInsert.of(
+                            ImmutableMap.of(
+                                "ts",
+                                rowTs.toString(),
+                                "key",
+                                "sensor_1",
+                                "value",
+                                value)));
                   }
+                  bigQueryResourceManager.write(tableName, rows);
+                  totalRows += currentRate;
 
                   if ((second + 1) % 60 == 0 || isAnomaly) {
                     LOG.info(
-                        "Inserted second {}: {} total rows, sineVal={}{}",
+                        "Inserted second {}: rate={}, {} total rows{}",
                         second + 1,
+                        currentRate,
                         totalRows,
-                        sineVal,
                         isAnomaly ? " ** ANOMALY **" : "");
                   }
 
                   second++;
+
+                  // Pace to ~1 batch/sec.
+                  long elapsed = System.currentTimeMillis() - batchStart;
+                  long sleepMs = BATCH_INTERVAL_MS - elapsed;
+                  if (sleepMs > 0) {
+                    TimeUnit.MILLISECONDS.sleep(sleepMs);
+                  }
                 }
 
-                LOG.info("Data insertion stopped after {} seconds ({} rows)", second, totalRows);
+                LOG.info(
+                    "Data insertion stopped after {} seconds ({} rows)",
+                    second, totalRows);
               } catch (InterruptedException e) {
                 LOG.info("Data insertion thread interrupted");
                 Thread.currentThread().interrupt();
