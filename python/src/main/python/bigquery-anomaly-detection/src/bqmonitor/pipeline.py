@@ -1133,7 +1133,7 @@ def build_pipeline(pipeline, options, metric_spec, detector):
     # hint. Only needed when input is keyed (group_by or sliding
     # offset keys) so each key gets independent ZScore state.
     if not _timesfm_unkeyed:
-      residuals.element_type = tuple[Any, beam.Row]
+      residuals.element_type = beam.typehints.Tuple[Any, beam.Row]
 
     from apache_beam.ml.anomaly.detectors import zscore as _zs  # noqa
     residual_detector = Specifiable.from_spec(
