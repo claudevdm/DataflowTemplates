@@ -1146,9 +1146,10 @@ def build_pipeline(pipeline, options, metric_spec, detector):
 
     # Step 3: Feed residuals into ZScore to detect anomalous errors.
     # AnomalyDetection detects keyed input via TupleConstraint type
-    # hint — add it so each key gets independent ZScore state.
-    keyed_residuals = residuals | 'TypeHintResiduals' >> beam.Map(
-        lambda x: x).with_output_types(tuple[Any, beam.Row])
+    # hint. Only needed when input is keyed (group_by or sliding
+    # offset keys) so each key gets independent ZScore state.
+    if not _timesfm_unkeyed:
+      residuals.element_type = tuple[Any, beam.Row]
 
     from apache_beam.ml.anomaly.detectors import zscore as _zs  # noqa
     residual_detector = Specifiable.from_spec(
@@ -1164,7 +1165,7 @@ def build_pipeline(pipeline, options, metric_spec, detector):
         }),
         _run_init=True)
     residual_anomalies = (
-        keyed_residuals
+        residuals
         | 'DetectResidualAnomalies' >> AnomalyDetection(residual_detector)
     )
 
